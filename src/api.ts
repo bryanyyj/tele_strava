@@ -2,6 +2,7 @@ import { get, put } from './store';
 
 export interface Tokens { access_token: string; refresh_token: string; expires_at: number; athlete: { id: number } }
 export interface Activity { id: number; name: string; description: string | null; sport_type: string; athlete: { id: number } }
+export type SummaryActivity = Omit<Activity, 'description'> & { start_date_local?: string };
 export interface Gear { id: string; name: string }
 export interface Athlete { id: number; shoes: Gear[]; bikes: Gear[] }
 export type Button = { text: string; callback_data?: string; url?: string };

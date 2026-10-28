@@ -1,4 +1,4 @@
-import { Activity, Athlete, Button, Gear, Tokens, send, strava, telegram } from './api';
+import { Activity, Athlete, Button, Gear, SummaryActivity, Tokens, send, strava, telegram } from './api';
 import { DAY, get, put, remove } from './store';
 
 export interface Update {
@@ -126,7 +126,28 @@ export async function handleUpdate(env: Env, update: Update) {
   const text = message.text?.trim();
   if (!text) return;
   if (text === '/start' || text === '/help') {
-    await send(env, 'Use /connect to authorize Strava. New activities will appear here automatically. Choose Yes to edit name → description → gear, or change gear only. /skip keeps a field; /clear clears the description; /cancel discards an edit. /disconnect revokes access.'); return;
+    await send(env, 'Use /connect to authorize Strava. New activities will appear here automatically. /activities shows your last 5 activities with edit buttons. Choose Yes to edit name → description → gear, or change gear only. /skip keeps a field; /clear clears the description; /cancel discards an edit. /disconnect revokes access.'); return;
+  }
+  if (text === '/activities') {
+    if (!await get<Tokens>(env, 'tokens')) {
+      await send(env, 'Use /connect to link your Strava account before listing activities.'); return;
+    }
+    const activities = await strava<SummaryActivity[]>(env, '/athlete/activities?page=1&per_page=5');
+    const tokens = await get<Tokens>(env, 'tokens');
+    const recent = activities.slice(0, 5).filter(activity => activity.athlete.id === tokens?.athlete.id);
+    if (!recent.length) { await send(env, 'No Strava activities found yet.'); return; }
+    await send(env, `Your ${recent.length} most recent Strava ${recent.length === 1 ? 'activity' : 'activities'}. Choose Edit activity to change name, description and gear, or change gear only.`);
+    for (const activity of recent) {
+      // The list returns summaries; the edit callback fetches fresh activity details.
+      await put(env, `activity:${activity.id}`, activity, DAY * 7);
+      const date = activity.start_date_local?.slice(0, 10);
+      await send(env, `${activity.name}\n${activity.sport_type}${date ? ` · ${date}` : ''}`, [
+        [{ text: 'Edit activity', callback_data: `edit:${activity.id}` }],
+        [{ text: 'Change gear only', callback_data: `gear:${activity.id}` }],
+        [{ text: 'Open in Strava / add media', url: `https://www.strava.com/activities/${activity.id}` }],
+      ]);
+    }
+    return;
   }
   if (text === '/connect') {
     const state = crypto.randomUUID();

@@ -8,6 +8,9 @@ A private Telegram bot that notifies you about new Strava activities and edits t
 2. A new Strava activity triggers a message with **Yes**, **No**, **Change gear only**, and **Open in Strava** buttons.
 3. Choose Yes: enter a name → enter a description → tap a shoe/bike button. Selecting gear saves the staged changes together through `PUT /activities/{id}`.
 4. `/skip` keeps a field, `/clear` clears a description, and `/cancel` discards the current edit. Only one edit is active at a time. `/disconnect` revokes Strava access and removes stored account data.
+5. Send `/activities` anytime to fetch your five most recent activities, including activities recorded before connecting the bot. Each has **Edit activity**, **Change gear only**, and **Open in Strava** buttons. Editing follows the same name → description → gear flow. Listing activities preserves any unfinished edit; finish it or use `/cancel` before selecting another.
+
+You can type `/activities` directly without changing webhook configuration. To show it in Telegram's slash-command menu, use **@BotFather → /setcommands** for your bot and include `activities - Show the last 5 Strava activities` with your existing commands.
 
 Shoes are listed for runs/walks/hikes and bikes for cycling activities. Gear comes from your Strava athlete profile. You can keep or remove gear, including when no compatible gear is listed.
 

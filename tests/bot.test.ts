@@ -72,6 +72,49 @@ describe('security and webhook admission', () => {
 });
 
 describe('activity editing', () => {
+  it('lists the last five activities and opens a historical activity in the full edit flow', async () => {
+    const summaries = Array.from({ length: 5 }, (_, index) => ({ ...activity, id: 123 + index, name: `Run ${index + 1}`, start_date_local: '2026-10-28T08:00:00Z' }));
+    vi.mocked(fetch).mockImplementationOnce(async (url) => {
+      calls.push({ url: String(url), payload: {} });
+      return Response.json(summaries);
+    });
+    await handleUpdate(env, message(1, '/activities'));
+    expect(calls[0].url).toBe('https://www.strava.com/api/v3/athlete/activities?page=1&per_page=5');
+    const cards = calls.filter(c => c.payload.reply_markup);
+    expect(cards).toHaveLength(5);
+    expect(cards[0].payload.reply_markup.inline_keyboard[0][0].callback_data).toBe('edit:123');
+    expect(cards[4].payload.reply_markup.inline_keyboard[1][0].callback_data).toBe('gear:127');
+    expect(await get(env, 'notified:123')).toBeNull();
+    await handleUpdate(env, callback(2, 'edit:123'));
+    expect((await get<any>(env, 'session')).step).toBe('name');
+    await handleUpdate(env, message(3, 'Updated historical run'));
+    await handleUpdate(env, message(4, 'Updated description'));
+    const session = await get<any>(env, 'session');
+    await handleUpdate(env, callback(5, `pick:${session.nonce}:1`));
+    expect(calls.find(c => c.payload.gear_id)?.payload).toEqual({ name: 'Updated historical run', description: 'Updated description', gear_id: 'g2' });
+  });
+  it('handles an empty history and a disconnected account', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json([]));
+    await handleUpdate(env, message(1, '/activities'));
+    expect(calls.at(-1)?.payload.text).toBe('No Strava activities found yet.');
+    await env.DB.prepare('DELETE FROM records').run();
+    calls = [];
+    await handleUpdate(env, message(2, '/activities'));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].payload.text).toContain('/connect');
+  });
+  it('preserves a pending edit when listing activities and rejects other users', async () => {
+    await activityEvent(env, event);
+    await handleUpdate(env, callback(1, 'edit:123'));
+    await handleUpdate(env, message(2, 'Pending name'));
+    const session = await get(env, 'session');
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json([activity]));
+    await handleUpdate(env, message(3, '/activities'));
+    expect(await get(env, 'session')).toEqual(session);
+    calls = [];
+    await handleUpdate(env, { update_id: 4, message: { from: { id: 8 }, chat: { id: 8, type: 'private' }, text: '/activities' } });
+    expect(calls).toHaveLength(0);
+  });
   it('notifies once for a linked owner and ignores update loops', async () => {
     await activityEvent(env, { ...event, owner_id: 999 });
     await activityEvent(env, { ...event, aspect_type: 'update' });
