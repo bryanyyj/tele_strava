@@ -5,7 +5,7 @@
   "compatibility_date": "2026-10-28",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true, "logs": { "enabled": true, "invocation_logs": false } },
-  "d1_databases": [{ "binding": "DB", "database_name": "tele-strava", "migrations_dir": "migrations" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "tele-strava", "database_id": "3ec6b92b-b149-42f4-b248-9d5a70d02a71", "migrations_dir": "migrations" }],
   "queues": {
     "producers": [{ "binding": "EVENTS", "queue": "tele-strava-events" }],
     "consumers": [{ "queue": "tele-strava-events", "max_batch_size": 1, "max_concurrency": 1, "max_retries": 5, "retry_delay": 30, "dead_letter_queue": "tele-strava-dead" }]
