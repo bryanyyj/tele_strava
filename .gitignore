@@ -10,3 +10,9 @@ coverage/
 !.dev.vars.example
 *.log
 .deploy-*.json
+# Local bulk-secret exports and private key containers.
+secrets.json
+secrets.*.json
+*.key
+*.p12
+*.pfx
