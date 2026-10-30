@@ -49,11 +49,28 @@ describe('security and webhook admission', () => {
     expect(response.status).toBe(403);
     expect(env.EVENTS.send).not.toHaveBeenCalled();
   });
-  it('durably queues accepted Telegram updates', async () => {
-    const response = await route(new Request('https://example.com/webhooks/telegram', { method: 'POST', headers: { 'X-Telegram-Bot-Api-Secret-Token': 'tg-secret' }, body: JSON.stringify(message(1, '/start')) }), env);
+  it('responds to Telegram directly and deduplicates redeliveries without queueing', async () => {
+    const request = () => new Request('https://example.com/webhooks/telegram', { method: 'POST', headers: { 'X-Telegram-Bot-Api-Secret-Token': 'tg-secret' }, body: JSON.stringify(message(1, '/start')) });
+    const response = await route(request(), env);
     expect(response.status).toBe(200);
-    expect(env.EVENTS.send).toHaveBeenCalledWith({ kind: 'telegram', payload: message(1, '/start') });
+    expect(env.EVENTS.send).not.toHaveBeenCalled();
+    expect(calls.filter(c => c.url.endsWith('/sendMessage'))).toHaveLength(1);
+    await route(request(), env);
+    expect(calls.filter(c => c.url.endsWith('/sendMessage'))).toHaveLength(1);
+  });
+  it('still queues Strava events before acknowledging', async () => {
+    const response = await route(new Request('https://example.com/webhooks/strava/strava-secret', { method: 'POST', body: JSON.stringify(event) }), env);
+    expect(response.status).toBe(200);
+    expect(env.EVENTS.send).toHaveBeenCalledWith({ kind: 'strava', payload: event });
     expect(calls).toHaveLength(0);
+  });
+  it('lets Telegram retry transient failures instead of acknowledging lost updates', async () => {
+    vi.mocked(fetch).mockRejectedValueOnce(new Error('Network failure'));
+    const request = () => new Request('https://example.com/webhooks/telegram', { method: 'POST', headers: { 'X-Telegram-Bot-Api-Secret-Token': 'tg-secret' }, body: JSON.stringify(message(80, '/help')) });
+    expect((await worker.fetch!(request(), env, {} as any)).status).toBe(500);
+    expect(await get(env, 'tg:80')).toBeNull();
+    expect((await worker.fetch!(request(), env, {} as any)).status).toBe(200);
+    expect(await get(env, 'tg:80')).toBe(true);
   });
   it('validates Strava challenge and secret path', async () => {
     expect((await route(new Request('https://example.com/webhooks/strava/wrong'), env)).status).toBe(404);
@@ -72,6 +89,43 @@ describe('security and webhook admission', () => {
 });
 
 describe('activity editing', () => {
+  it('sends the first prompt before acknowledgement or gear prefetch finish, then reuses the gear cache', async () => {
+    await put(env, 'activity:123', activity, DAY);
+    const background: Promise<unknown>[] = [];
+    const ctx = { waitUntil: (promise: Promise<unknown>) => background.push(promise) } as unknown as ExecutionContext;
+    const normalFetch = vi.mocked(fetch).getMockImplementation()!;
+    let acknowledge!: (response: Response) => void;
+    let loadGear!: (response: Response) => void;
+    const acknowledgement = new Promise<Response>(resolve => { acknowledge = resolve; });
+    const gears = new Promise<Response>(resolve => { loadGear = resolve; });
+    vi.mocked(fetch).mockImplementation((url, init) => {
+      if (String(url).endsWith('/answerCallbackQuery')) return acknowledgement;
+      if (String(url).endsWith('/athlete')) return gears;
+      return normalFetch(url, init);
+    });
+    try {
+      const response = await route(new Request('https://example.com/webhooks/telegram', { method: 'POST', headers: { 'X-Telegram-Bot-Api-Secret-Token': 'tg-secret' }, body: JSON.stringify(callback(70, 'edit:123')) }), env, ctx);
+      expect(response.status).toBe(200);
+      expect(calls.some(c => c.payload.text?.includes('1/3'))).toBe(true);
+      expect(calls.some(c => c.url.includes('/activities/123'))).toBe(false);
+    } finally {
+      acknowledge(Response.json({ ok: true, result: true }));
+      loadGear(Response.json(athlete));
+      await Promise.all(background);
+    }
+    // Even an unavailable Strava API must not delay name/description prompts.
+    calls = [];
+    await handleUpdate(env, message(71, 'Faster name'));
+    await handleUpdate(env, message(72, 'Faster description'));
+    expect(calls.every(c => c.url.includes('api.telegram.org'))).toBe(true);
+    const session = await get<any>(env, 'session');
+    expect(session.gears).toEqual(athlete.shoes);
+    expect(session.patch).toEqual({ name: 'Faster name', description: 'Faster description' });
+    await handleUpdate(env, callback(73, `pick:${session.nonce}:0`));
+    const saves = calls.filter(c => c.url.endsWith('/activities/123'));
+    expect(saves).toHaveLength(1);
+    expect(saves[0].payload).toEqual({ name: 'Faster name', description: 'Faster description', gear_id: 'g1' });
+  });
   it('lists the last five activities and opens a historical activity in the full edit flow', async () => {
     const summaries = Array.from({ length: 5 }, (_, index) => ({ ...activity, id: 123 + index, name: `Run ${index + 1}`, start_date_local: '2026-10-28T08:00:00Z' }));
     vi.mocked(fetch).mockImplementationOnce(async (url) => {

@@ -23,14 +23,30 @@ async function body(request: Request): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
-export async function route(request: Request, env: Env): Promise<Response> {
+async function processTelegramUpdate(env: Env, update: Update, ctx?: ExecutionContext) {
+  const id = `tg:${update.update_id}`;
+  if (await get(env, id)) return;
+  try {
+    await handleUpdate(env, update, ctx);
+  } catch (error) {
+    if (!(error instanceof ApiError) || !error.service.startsWith('Strava') || ![400, 401, 403, 404].includes(error.status)) throw error;
+    await send(env, error.status === 401 || error.status === 403
+      ? 'Strava authorization failed. Use /connect to authorize again with all requested permissions.'
+      : 'Strava could not apply this edit. The activity may be unavailable or the gear invalid. Use /cancel and try again.');
+  }
+  await put(env, id, true, DAY * 7);
+}
+
+export async function route(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === '/health' && request.method === 'GET') return Response.json({ ok: true });
   if (url.pathname === '/webhooks/telegram' && request.method === 'POST') {
     if (!env.TELEGRAM_WEBHOOK_SECRET || request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.TELEGRAM_WEBHOOK_SECRET) return new Response('Forbidden', { status: 403 });
     const update = await body(request) as Update;
     if (!Number.isSafeInteger(update?.update_id)) return new Response('Invalid update', { status: 400 });
-    if (isOwner(env, update)) await env.EVENTS.send({ kind: 'telegram', payload: update });
+    // Telegram is configured with max_connections=1, serializing conversation turns.
+    // Complete before acknowledging so failed requests are retried by Telegram.
+    if (isOwner(env, update)) await processTelegramUpdate(env, update, ctx);
     return new Response('OK');
   }
   if (env.STRAVA_WEBHOOK_SECRET && url.pathname === `/webhooks/strava/${env.STRAVA_WEBHOOK_SECRET}`) {
@@ -63,17 +79,18 @@ export async function route(request: Request, env: Env): Promise<Response> {
 }
 
 export default {
-  async fetch(request, env) {
-    try { return await route(request, env); }
+  async fetch(request, env, ctx) {
+    try { return await route(request, env, ctx); }
     catch { return new Response('Request failed. Please retry.', { status: 500 }); }
   },
-  async queue(batch, env) {
+  async queue(batch, env, ctx) {
     for (const message of batch.messages) {
       const job = message.body as Job;
       const id = job.kind === 'telegram' ? `tg:${job.payload.update_id}` : `sv:${job.payload.object_type}:${job.payload.object_id}:${job.payload.aspect_type}:${job.payload.event_time}`;
       try {
         if (!await get(env, id)) {
-          if (job.kind === 'telegram') await handleUpdate(env, job.payload);
+          // Support Telegram jobs already queued before the direct-handler update.
+          if (job.kind === 'telegram') await processTelegramUpdate(env, job.payload, ctx);
           else await activityEvent(env, job.payload);
           await put(env, id, true, DAY * 7);
         }
@@ -81,16 +98,6 @@ export default {
       } catch (error) {
         // Do not log webhook bodies, OAuth codes, tokens or Telegram API URLs.
         console.error(JSON.stringify({ event: 'job_failed', kind: job.kind, status: error instanceof ApiError ? error.status : 500 }));
-        if (job.kind === 'telegram' && error instanceof ApiError && error.service.startsWith('Strava') && [400, 401, 403, 404].includes(error.status)) {
-          try {
-            await send(env, error.status === 401 || error.status === 403
-              ? 'Strava authorization failed. Use /connect to authorize again with all requested permissions.'
-              : 'Strava could not apply this edit. The activity may be unavailable or the gear invalid. Use /cancel and try again.');
-            await put(env, id, true, DAY * 7);
-            message.ack();
-            continue;
-          } catch { /* Retry if the error notice could not be delivered. */ }
-        }
         message.retry({ delaySeconds: error instanceof ApiError ? error.retryAfter : 30 });
       }
     }

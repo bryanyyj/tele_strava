@@ -1,4 +1,4 @@
-import { Activity, Athlete, Button, Gear, SummaryActivity, Tokens, send, strava, telegram } from './api';
+import { Activity, ApiError, Athlete, Button, Gear, SummaryActivity, Tokens, send, strava, telegram } from './api';
 import { DAY, get, put, remove } from './store';
 
 export interface Update {
@@ -50,8 +50,19 @@ export async function activityEvent(env: Env, event: Event) {
   await put(env, `notified:${activity.id}`, true, DAY * 30);
 }
 
-async function chooseGear(env: Env, session: Session) {
+async function loadAthlete(env: Env): Promise<Athlete> {
+  const tokens = await get<Tokens>(env, 'tokens');
+  const key = `gear-profile:${tokens?.athlete.id}`;
+  const cached = await get<Athlete>(env, key);
+  if (cached) return cached;
   const athlete = await strava<Athlete>(env, '/athlete');
+  if (athlete.id !== tokens?.athlete.id) throw new ApiError('Strava', 403);
+  await put(env, key, athlete, 5 * 60_000);
+  return athlete;
+}
+
+async function chooseGear(env: Env, session: Session) {
+  const athlete = await loadAthlete(env);
   session.gears = gearForActivity(athlete, session.activity.sport_type);
   session.step = 'gear';
   await put(env, 'session', session, DAY);
@@ -72,18 +83,20 @@ async function promptSession(env: Env, session: Session) {
   await send(env, session.gears?.length ? 'Choose your gear. This saves your changes.' : 'No compatible gear found. Keep or remove the current gear to save.', buttons);
 }
 
-export async function handleUpdate(env: Env, update: Update) {
+export async function handleUpdate(env: Env, update: Update, ctx?: ExecutionContext) {
   if (!isOwner(env, update)) return;
   const pending = await get<Session>(env, 'session');
   if (pending?.lastUpdate === update.update_id) { await promptSession(env, pending); return; }
   const query = update.callback_query;
   if (query) {
     // Old callbacks may exceed Telegram's response window; editing can still proceed.
-    await telegram(env, 'answerCallbackQuery', { callback_query_id: query.id }).catch(() => undefined);
+    const acknowledgement = telegram(env, 'answerCallbackQuery', { callback_query_id: query.id }).catch(() => undefined);
+    if (ctx) ctx.waitUntil(acknowledgement);
+    else await acknowledgement;
     const data = query.data ?? '';
     if (data.startsWith('pick:')) {
       const [, nonce, choice] = data.split(':');
-      const session = await get<Session>(env, 'session');
+      const session = pending;
       if (!session || session.nonce !== nonce || session.step !== 'gear') {
         await send(env, 'That gear menu has expired. Start again from the activity notification.'); return;
       }
@@ -94,7 +107,10 @@ export async function handleUpdate(env: Env, update: Update) {
         if (!gear) { await send(env, 'Invalid gear selection. Please use the current buttons.'); return; }
         patch.gear_id = gear.id;
       }
-      if (Object.keys(patch).length) await strava(env, `/activities/${session.activity.id}`, patch);
+      if (Object.keys(patch).length) {
+        const saved = await strava<Activity>(env, `/activities/${session.activity.id}`, patch);
+        await put(env, `activity:${session.activity.id}`, saved, DAY * 7);
+      }
       await send(env, 'Activity saved. Add photos or videos directly in Strava.', [[{ text: 'Open activity', url: `https://www.strava.com/activities/${session.activity.id}` }]]);
       await remove(env, 'session');
       return;
@@ -105,15 +121,17 @@ export async function handleUpdate(env: Env, update: Update) {
     const known = await get<Activity>(env, `activity:${id}`);
     if (!known) { await send(env, 'This activity notification has expired or the activity was deleted.'); return; }
     if (action === 'no') { await send(env, 'Okay. You can use the notification buttons later.'); return; }
-    const activity = await strava<Activity>(env, `/activities/${id}`);
+    // Start from the authorized activity snapshot; PUT validates it again at save.
+    const activity = known;
     const tokens = await get<Tokens>(env, 'tokens');
     if (activity.athlete.id !== tokens?.athlete.id) return;
-    const existing = await get<Session>(env, 'session');
-    if (existing) { await send(env, 'Finish your current edit or use /cancel before starting another.'); return; }
+    if (pending) { await send(env, 'Finish your current edit or use /cancel before starting another.'); return; }
     const session: Session = { activity, step: 'name', mode: action === 'gear' ? 'gear' : 'edit', nonce: crypto.randomUUID().slice(0, 8), patch: {}, lastUpdate: update.update_id };
     if (action === 'gear') await chooseGear(env, session);
     else {
       await put(env, 'session', session, DAY);
+      // Warm gear choices while the user types, without holding up the prompt.
+      if (ctx) ctx.waitUntil(loadAthlete(env).catch(() => undefined));
       await promptSession(env, session);
     }
     return;
@@ -166,7 +184,7 @@ export async function handleUpdate(env: Env, update: Update) {
     await env.DB.prepare('DELETE FROM records').run();
     await send(env, 'Disconnected. Stored account data and pending edits were removed.'); return;
   }
-  const session = await get<Session>(env, 'session');
+  const session = pending;
   if (!session) { await send(env, 'Use /connect to get started, or choose an activity notification to edit.'); return; }
   if (session.step === 'gear') { await send(env, 'Choose a gear button above, or /cancel.'); return; }
   if (text.startsWith('/') && text !== '/skip' && !(text === '/clear' && session.step === 'description')) {
